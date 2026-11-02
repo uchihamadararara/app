@@ -1,0 +1,6 @@
+{
+  "name": "Aegis Lock",
+  "description": "Biometric & PIN/Pattern App Lock with 5-attempt 30s cooldown, Boot Persistence, Device Admin uninstall protection, and System Overlay control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

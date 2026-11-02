@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="360dp"
+    android:height="180dp"
+    android:viewportWidth="360"
+    android:viewportHeight="180">
+    <!-- Deep obsidian cyber background -->
+    <path android:pathData="M0,0h360v180h-360z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="0"
+                android:startY="0"
+                android:endX="360"
+                android:endY="180"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#08121E" />
+                <item android:offset="0.5" android:color="#0D1F2D" />
+                <item android:offset="1.0" android:color="#072227" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Subtle radar rings -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M280,90m-110,0a110,110 0,1 1,220 0a110,110 0,1 1,-220 0"
+        android:strokeWidth="1"
+        android:strokeColor="#1A10B981" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M280,90m-78,0a78,78 0,1 1,156 0a78,78 0,1 1,-156 0"
+        android:strokeWidth="1.2"
+        android:strokeColor="#2E06B6D4" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M280,90m-48,0a48,48 0,1 1,96 0a48,48 0,1 1,-96 0"
+        android:strokeWidth="1.5"
+        android:strokeColor="#4D10B981" />
+    <!-- Glowing Shield Silhouette on the Right -->
+    <path
+        android:fillColor="#2610B981"
+        android:pathData="M280,42L244,58v26c0,24.5 15.3,47.4 36,53 20.7,-5.6 36,-28.5 36,-53V58L280,42z"
+        android:strokeWidth="2"
+        android:strokeColor="#10B981" />
+    <!-- Inner Lock Core -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M280,68c6.6,0 12,5.4 12,12v6c2.2,0 4,1.8 4,4v18c0,2.2 -1.8,4 -4,4h-24c-2.2,0 -4,-1.8 -4,-4V90c0,-2.2 1.8,-4 4,-4v-6c0,-6.6 5.4,-12 12,-12zM280,74c-3.3,0 -6,2.7 -6,6v6h12v-6c0,-3.3 -2.7,-6 -6,-6z" />
+</vector>

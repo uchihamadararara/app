@@ -1,0 +1,19 @@
+<resources>
+    <string name="app_name">Aegis Lock</string>
+    <string name="device_admin_label">Aegis Lock Uninstall Protection</string>
+    <string name="device_admin_description">Prevents unauthorized uninstallation of Aegis Lock.</string>
+    <string name="device_admin_disable_warning">Disabling Device Administrator allows anyone to uninstall Aegis Lock.</string>
+    <string name="notif_channel_name">App Lock Protection</string>
+    <string name="notif_channel_desc">Keeps locked apps protected in the background.</string>
+    <string name="notif_active_title">App Lock Active</string>
+    <string name="notif_active_body">Protecting %1$d locked apps</string>
+    <string name="tab_apps">Apps</string>
+    <string name="tab_auth">Security</string>
+    <string name="tab_system">Permissions</string>
+    <string name="tab_logs">History</string>
+    <string name="biometric_prompt_title">Unlock App</string>
+    <string name="biometric_prompt_subtitle">Use Fingerprint or Face to unlock</string>
+    <string name="biometric_prompt_negative">Use Password</string>
+    <string name="cooldown_banner_title">Try Again Later</string>
+    <string name="cooldown_banner_subtitle">Too many wrong attempts. Try again in %1$ds.</string>
+</resources>
