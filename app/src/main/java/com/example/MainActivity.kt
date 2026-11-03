@@ -23,7 +23,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AdminPanelSettings
@@ -57,7 +56,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -66,6 +64,7 @@ import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.LockedAppEntity
 import com.example.system.BiometricAuthHelper
+import com.example.system.IntruderSelfieHelper
 import com.example.system.SystemPermissionHelper
 import com.example.ui.AegisViewModel
 import com.example.ui.components.LockScreenOverlayContent
@@ -205,9 +204,44 @@ fun AegisMainApp(
             isLocked = true
         )
         val showAsPhoneLock = isPhoneLockPreview || !isAppSessionUnlocked
+        val resolvedTargetName = if (showAsPhoneLock) "Phone Lock Screen" else target.appName
+
+        fun recordFailedAttemptAndSnapSelfie(authMethod: String) {
+            scope.launch {
+                val (attempts, triggeredCooldown, logId) = viewModel.repository.logAuthEvent(
+                    success = false,
+                    targetAppName = resolvedTargetName,
+                    targetPackage = target.packageName,
+                    authMethod = authMethod
+                )
+                if (vaultState.intruderSelfieEnabled) {
+                    val baseDetails = if (triggeredCooldown) {
+                        "CRITICAL: 5th failed attempt ($authMethod) on $resolvedTargetName! Enforcing mandatory 30-second system lockout."
+                    } else {
+                        "Invalid $authMethod attempt ($attempts/5 before 30s lockout) on $resolvedTargetName."
+                    }
+                    IntruderSelfieHelper.captureIntruderSelfie(
+                        context = activity,
+                        lifecycleOwner = activity,
+                        targetAppName = resolvedTargetName,
+                        attemptNumber = attempts,
+                        authMethod = authMethod,
+                        onPhotoSaved = { photoPath ->
+                            scope.launch {
+                                viewModel.repository.attachIntruderSelfieToLog(
+                                    logId = logId,
+                                    photoPath = photoPath,
+                                    baseDetails = baseDetails
+                                )
+                            }
+                        }
+                    )
+                }
+            }
+        }
 
         LockScreenOverlayContent(
-            targetAppName = if (showAsPhoneLock) "Phone Lock Screen" else target.appName,
+            targetAppName = resolvedTargetName,
             targetPackageName = target.packageName,
             vaultState = vaultState,
             isPhoneLockScreen = showAsPhoneLock,
@@ -218,7 +252,7 @@ fun AegisMainApp(
                 scope.launch {
                     viewModel.repository.logAuthEvent(
                         success = true,
-                        targetAppName = if (showAsPhoneLock) "Phone Lock Screen" else target.appName,
+                        targetAppName = resolvedTargetName,
                         targetPackage = target.packageName,
                         authMethod = method
                     )
@@ -228,14 +262,7 @@ fun AegisMainApp(
                 }
             },
             onAuthFailure = { method ->
-                scope.launch {
-                    viewModel.repository.logAuthEvent(
-                        success = false,
-                        targetAppName = if (showAsPhoneLock) "Phone Lock Screen" else target.appName,
-                        targetPackage = target.packageName,
-                        authMethod = method
-                    )
-                }
+                recordFailedAttemptAndSnapSelfie(method)
             },
             onTriggerHardwareBiometric = {
                 BiometricAuthHelper.authenticate(
@@ -246,7 +273,7 @@ fun AegisMainApp(
                         scope.launch {
                             viewModel.repository.logAuthEvent(
                                 success = true,
-                                targetAppName = if (showAsPhoneLock) "Phone Lock Screen" else target.appName,
+                                targetAppName = resolvedTargetName,
                                 targetPackage = target.packageName,
                                 authMethod = "BIOMETRIC"
                             )
@@ -256,14 +283,7 @@ fun AegisMainApp(
                         }
                     },
                     onFailureAttempt = {
-                        scope.launch {
-                            viewModel.repository.logAuthEvent(
-                                success = false,
-                                targetAppName = if (showAsPhoneLock) "Phone Lock Screen" else target.appName,
-                                targetPackage = target.packageName,
-                                authMethod = "BIOMETRIC"
-                            )
-                        }
+                        recordFailedAttemptAndSnapSelfie("BIOMETRIC")
                     },
                     onHardwareUnavailableOrNotEnrolled = { msg ->
                         Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show()
@@ -492,6 +512,26 @@ fun AegisMainApp(
                         SystemControlScreen(
                             vaultState = vaultState,
                             capabilities = capabilities,
+                            onRequestAccessibilityPermission = {
+                                runCatching {
+                                    val intent = SystemPermissionHelper.buildAccessibilitySettingsIntent()
+                                    settingsIntentLauncher.launch(intent)
+                                }
+                            },
+                            onRequestNotificationListenerPermission = {
+                                runCatching {
+                                    val intent = SystemPermissionHelper.buildNotificationListenerSettingsIntent()
+                                    settingsIntentLauncher.launch(intent)
+                                }
+                            },
+                            onToggleNotificationPrivacy = viewModel::toggleNotificationPrivacy,
+                            onTestMaskedNotification = viewModel::sendSampleMaskedNotification,
+                            onRequestIgnoreBatteryOptimizations = {
+                                runCatching {
+                                    val intent = SystemPermissionHelper.buildIgnoreBatteryOptimizationsIntent(activity)
+                                    settingsIntentLauncher.launch(intent)
+                                }
+                            },
                             onRequestDeviceAdmin = {
                                 runCatching {
                                     val intent = SystemPermissionHelper.buildEnableDeviceAdminIntent(activity)
@@ -523,6 +563,10 @@ fun AegisMainApp(
                     AegisTab.LOGS -> {
                         IntruderLogsScreen(
                             logs = logs,
+                            vaultState = vaultState,
+                            capabilities = capabilities,
+                            onToggleIntruderSelfie = viewModel::toggleIntruderSelfie,
+                            onRefreshCapabilities = viewModel::refreshSystemCapabilities,
                             onClearLogs = viewModel::clearSecurityLogs
                         )
                     }

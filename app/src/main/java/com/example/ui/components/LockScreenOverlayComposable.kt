@@ -1,15 +1,27 @@
 package com.example.ui.components
 
 import android.content.Context
+import android.graphics.BitmapFactory
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,7 +44,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -44,12 +55,12 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -61,12 +72,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -76,19 +92,44 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.R
 import com.example.data.LockAuthMode
+import com.example.data.SecurityCrypto
 import com.example.data.SecurityVaultState
+import com.example.system.BiometricAuthHelper
 import com.example.ui.screens.ClassicNumericPad
 import com.example.ui.theme.ClassicDangerRed
 import com.example.ui.theme.ClassicPrimaryBlue
 import com.example.ui.theme.JetBrainsMonoFamily
 import kotlinx.coroutines.delay
+import java.io.File
+import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.sqrt
 
 enum class ActiveInputTab {
     PIN,
     PATTERN,
     MIXED
+}
+
+/**
+ * Real Native Android 16 3-Stage Lock Screen Flow (Zero fake/demo buttons on the lock screen):
+ * 1. RAISE_TO_WAKE_AOD: Pure black Ambient AOD screen when phone is flat/idle. Shows ONLY
+ *    Face icon, Date, large Clock, and the visible In-Display Fingerprint icon at the bottom.
+ *    Raising the phone (detected via hardware Accelerometer) or tapping wakes to WALLPAPER_LOCK.
+ * 2. WALLPAPER_LOCK: Full-bleed lock screen wallpaper (matching the user's lock screen) with
+ *    top Face icon, Date, large 10:35 Clock, and visible In-Display Fingerprint icon at the bottom.
+ * 3. SWIPED_UP_AUTH: Triggered by swiping up on the Lock Screen (or directly when opening a locked app):
+ *    - Visible fingerprint icon disappears (`hideUntilTouched = true`), appearing with optical animation ONLY when touched.
+ *    - Automatic Face Detection starts immediately.
+ *    - Displays the user's configured PIN (4/6 digit), Pattern, or Mixed Password input.
+ *    - Swiping down returns to WALLPAPER_LOCK just like native Android.
+ */
+enum class PhoneLockScreenStage {
+    RAISE_TO_WAKE_AOD,
+    WALLPAPER_LOCK,
+    SWIPED_UP_AUTH
 }
 
 @Composable
@@ -97,6 +138,7 @@ fun LockScreenOverlayContent(
     targetPackageName: String,
     vaultState: SecurityVaultState,
     isPhoneLockScreen: Boolean = false,
+    startInAmbientAod: Boolean = false,
     onVerifyPin: (String) -> Boolean,
     onVerifyPattern: (List<Int>) -> Boolean,
     onVerifyMixedPassword: (String) -> Boolean = { false },
@@ -107,6 +149,68 @@ fun LockScreenOverlayContent(
     onExitToHomeScreen: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
+
+    var lockStage by remember(isPhoneLockScreen, startInAmbientAod) {
+        mutableStateOf(
+            when {
+                !isPhoneLockScreen -> PhoneLockScreenStage.SWIPED_UP_AUTH
+                startInAmbientAod -> PhoneLockScreenStage.RAISE_TO_WAKE_AOD
+                else -> PhoneLockScreenStage.WALLPAPER_LOCK
+            }
+        )
+    }
+
+    // Load custom wallpaper if configured in Security settings, otherwise use R.drawable.default_lock_wallpaper
+    val customWallpaperBitmap: ImageBitmap? = remember(context) {
+        val customFile = File(SecurityCrypto.getDeviceProtectedContext(context).filesDir, "custom_lock_wallpaper.jpg")
+        if (customFile.exists()) {
+            runCatching { BitmapFactory.decodeFile(customFile.absolutePath)?.asImageBitmap() }.getOrNull()
+        } else {
+            null
+        }
+    }
+
+    // Real Hardware Accelerometer listener for Android 16 "Raise to Wake":
+    // Only active while on the Phone Lock Screen before swiping up, using low-power SENSOR_DELAY_NORMAL
+    DisposableEffect(isPhoneLockScreen, lockStage) {
+        if (!isPhoneLockScreen || lockStage == PhoneLockScreenStage.SWIPED_UP_AUTH) {
+            return@DisposableEffect onDispose {}
+        }
+        val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+        val accel = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        val listener = object : SensorEventListener {
+            private var flatSamples = 0
+            override fun onSensorChanged(event: SensorEvent?) {
+                val values = event?.values ?: return
+                val x = values[0]
+                val y = values[1]
+                val z = values[2]
+                val magnitude = sqrt(x * x + y * y + z * z)
+                val isFlatOnTable = abs(x) < 2.0f && abs(y) < 2.0f && z > 8.8f
+                val isRaisedInHand = y > 4.2f && magnitude > 8.8f
+
+                if (lockStage == PhoneLockScreenStage.RAISE_TO_WAKE_AOD && isRaisedInHand) {
+                    flatSamples = 0
+                    lockStage = PhoneLockScreenStage.WALLPAPER_LOCK
+                } else if (lockStage == PhoneLockScreenStage.WALLPAPER_LOCK && isFlatOnTable) {
+                    flatSamples++
+                    if (flatSamples >= 8) {
+                        lockStage = PhoneLockScreenStage.RAISE_TO_WAKE_AOD
+                    }
+                } else {
+                    flatSamples = 0
+                }
+            }
+
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+        }
+        if (accel != null) {
+            sensorManager.registerListener(listener, accel, SensorManager.SENSOR_DELAY_NORMAL)
+        }
+        onDispose {
+            sensorManager?.unregisterListener(listener)
+        }
+    }
 
     var currentInputTab by remember(vaultState.activeAuthMode) {
         mutableStateOf(
@@ -121,14 +225,20 @@ fun LockScreenOverlayContent(
     var enteredPin by remember { mutableStateOf("") }
     var enteredMixed by remember { mutableStateOf("") }
     var showMixedText by remember { mutableStateOf(false) }
-    var feedbackMessage by remember(isPhoneLockScreen, targetAppName) {
+    var isFaceAutoScanning by remember { mutableStateOf(false) }
+    var feedbackMessage by remember(isPhoneLockScreen, targetAppName, lockStage) {
         mutableStateOf(
-            if (isPhoneLockScreen) "Unlock your phone"
-            else "Enter your password to unlock $targetAppName"
+            when {
+                lockStage == PhoneLockScreenStage.SWIPED_UP_AUTH && isPhoneLockScreen ->
+                    "Enter ${vaultState.activeAuthMode.label}"
+                isPhoneLockScreen ->
+                    ""
+                else ->
+                    "Enter your password to unlock $targetAppName"
+            }
         )
     }
     var isErrorFeedback by remember { mutableStateOf(false) }
-    var showFaceCameraDialog by remember { mutableStateOf(false) }
 
     // 5-Attempt -> 30-Second Fixed Cooldown Timer & Live Clock
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -136,57 +246,291 @@ fun LockScreenOverlayContent(
     val isInCooldown = remainingCooldownMs > 0L
     val remainingSeconds = ((remainingCooldownMs + 999L) / 1000L).toInt()
 
-    val clockTimeStr = remember(nowMs / 1000L) {
+    val clockTimeStr = remember(nowMs / 15_000L) {
         java.text.SimpleDateFormat("hh:mm", java.util.Locale.getDefault()).format(java.util.Date(nowMs))
     }
-    val clockDateStr = remember(nowMs / 60_000L) {
-        java.text.SimpleDateFormat("EEEE, d MMMM", java.util.Locale.getDefault()).format(java.util.Date(nowMs))
+    val clockDateShortStr = remember(nowMs / 60_000L) {
+        java.text.SimpleDateFormat("EEE d MMM", java.util.Locale.getDefault()).format(java.util.Date(nowMs))
     }
 
+    // Automatic Face Detection when the user swipes up on the Lock Screen (SWIPED_UP_AUTH)
+    // or when a locked app opens!
+    LaunchedEffect(lockStage, targetPackageName) {
+        if (lockStage == PhoneLockScreenStage.SWIPED_UP_AUTH) {
+            val currentCooldown = (vaultState.cooldownUntilEpochMs - System.currentTimeMillis())
+            if (currentCooldown <= 0L) {
+                isFaceAutoScanning = true
+                if ((vaultState.faceUnlockEnabled || vaultState.fingerprintEnabled) &&
+                    BiometricAuthHelper.canUseHardwareBiometrics(context)
+                ) {
+                    delay(200L)
+                    onTriggerHardwareBiometric()
+                }
+            }
+        } else {
+            isFaceAutoScanning = false
+        }
+    }
+
+    // Battery-friendly timer: only ticks every 250ms during an active 30-second cooldown;
+    // otherwise sleeps for 15 seconds at a time just to keep the clock minute updated!
     LaunchedEffect(vaultState.cooldownUntilEpochMs, isPhoneLockScreen) {
         while (true) {
             nowMs = System.currentTimeMillis()
+            val activeCooldown = vaultState.cooldownUntilEpochMs > nowMs
             if (vaultState.cooldownUntilEpochMs in 1..nowMs) {
                 onCooldownExpired()
                 feedbackMessage = "Cooldown finished. Please enter your password."
                 isErrorFeedback = false
             }
-            delay(250L)
+            delay(if (activeCooldown) 250L else 15_000L)
         }
     }
 
-    if (showFaceCameraDialog) {
-        CameraFaceScannerDialog(
-            isEnrollmentMode = false,
-            onDismiss = { showFaceCameraDialog = false },
-            onFaceScanSuccess = {
-                showFaceCameraDialog = false
-                vibrateDevice(context, 40L)
-                onAuthSuccess("FACE_LOCK")
+    // =========================================================================
+    // STAGE 1 & STAGE 2 (Real Native Android 16 Phone Lock Screen — NO demo buttons!)
+    // =========================================================================
+    if (isPhoneLockScreen && lockStage != PhoneLockScreenStage.SWIPED_UP_AUTH) {
+        AnimatedContent(
+            targetState = lockStage,
+            transitionSpec = {
+                fadeIn() togetherWith fadeOut()
             },
-            onFaceScanFailed = {
-                vibrateDevice(context, 130L)
-                isErrorFeedback = true
-                onAuthFailure("FACE_LOCK")
-                val nextAttempt = vaultState.failedAttempts + 1
-                feedbackMessage = if (nextAttempt % 5 == 0) {
-                    "5 wrong attempts. Try again in 30 seconds."
-                } else {
-                    "Face not recognized (${nextAttempt % 5}/5 attempts)"
+            label = "PhoneLockStages"
+        ) { stage ->
+            when (stage) {
+                // -------------------------------------------------------------
+                // STAGE 1: Android 16 "Raise to Wake" / Minimal Ambient Screen
+                // Pure black screen showing ONLY Face icon, Date, Time, and
+                // the visible In-Display Fingerprint icon at the bottom.
+                // -------------------------------------------------------------
+                PhoneLockScreenStage.RAISE_TO_WAKE_AOD -> {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black)
+                            .pointerInput(Unit) {
+                                detectVerticalDragGestures { _, dragAmount ->
+                                    if (dragAmount < -24f) {
+                                        vibrateDevice(context, 20L)
+                                        lockStage = PhoneLockScreenStage.SWIPED_UP_AUTH
+                                    }
+                                }
+                            }
+                            .clickable {
+                                // Tapping wakes from Raise-to-Wake AOD to the Wallpaper Lock Screen
+                                lockStage = PhoneLockScreenStage.WALLPAPER_LOCK
+                            }
+                            .testTag("raise_to_wake_aod_screen")
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .windowInsetsPadding(WindowInsets.safeDrawing)
+                                .padding(top = 46.dp)
+                        ) {
+                            LockScreenFaceStatusIcon(
+                                isScanning = false,
+                                tint = Color.White.copy(alpha = 0.78f),
+                                modifier = Modifier.size(32.dp)
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = clockDateShortStr,
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontSize = 19.sp,
+                                    fontWeight = FontWeight.Medium
+                                ),
+                                color = Color.White.copy(alpha = 0.85f)
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = clockTimeStr,
+                                style = MaterialTheme.typography.displayLarge.copy(
+                                    fontSize = 92.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = (-2).sp
+                                ),
+                                color = Color.White.copy(alpha = 0.92f)
+                            )
+                        }
+
+                        // Bottom In-Display Fingerprint Icon positioned low at the bottom sensor spot
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 18.dp)
+                        ) {
+                            InDisplayFingerprintSensorZone(
+                                label = "",
+                                hideUntilTouched = false,
+                                onDarkBackground = true,
+                                onTriggerSystemBiometric = onTriggerHardwareBiometric
+                            )
+                        }
+                    }
                 }
+
+                // -------------------------------------------------------------
+                // STAGE 2: Real Android 16 Wallpaper Lock Screen (Zero demo buttons!)
+                // Exact layout from the user's lock screen:
+                // - Full-bleed Wallpaper
+                // - Top center: Face icon (`☺`), Date (`Tue 3 Nov`), Large Clock (`10:35`)
+                // - Bottom center: Visible In-Display Fingerprint icon aligned low between Phone & Camera icons
+                // - Swiping up anywhere transitions to Stage 3 (SWIPED_UP_AUTH)
+                // -------------------------------------------------------------
+                PhoneLockScreenStage.WALLPAPER_LOCK -> {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .pointerInput(Unit) {
+                                detectVerticalDragGestures { _, dragAmount ->
+                                    if (dragAmount < -22f) {
+                                        vibrateDevice(context, 22L)
+                                        lockStage = PhoneLockScreenStage.SWIPED_UP_AUTH
+                                    }
+                                }
+                            }
+                            .testTag("wallpaper_lock_screen")
+                    ) {
+                        if (customWallpaperBitmap != null) {
+                            Image(
+                                bitmap = customWallpaperBitmap,
+                                contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            Image(
+                                painter = painterResource(id = R.drawable.default_lock_wallpaper),
+                                contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+
+                        // Top Center: Face Icon + Date ("Tue 3 Nov") + Large Bold White Clock ("10:35")
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .windowInsetsPadding(WindowInsets.safeDrawing)
+                                .padding(top = 46.dp)
+                        ) {
+                            LockScreenFaceStatusIcon(
+                                isScanning = false,
+                                tint = Color.White,
+                                modifier = Modifier.size(36.dp)
+                            )
+
+                            Spacer(modifier = Modifier.height(16.dp))
+
+                            Text(
+                                text = clockDateShortStr,
+                                style = MaterialTheme.typography.titleLarge.copy(
+                                    fontSize = 21.sp,
+                                    fontWeight = FontWeight.Medium
+                                ),
+                                color = Color.White
+                            )
+
+                            Text(
+                                text = clockTimeStr,
+                                style = MaterialTheme.typography.displayLarge.copy(
+                                    fontSize = 98.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = (-2).sp
+                                ),
+                                color = Color.White
+                            )
+                        }
+
+                        // Bottom In-Display Fingerprint Sensor positioned low between the Phone & Camera icons
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 18.dp)
+                        ) {
+                            InDisplayFingerprintSensorZone(
+                                label = "",
+                                hideUntilTouched = false,
+                                onDarkBackground = true,
+                                onTriggerSystemBiometric = onTriggerHardwareBiometric
+                            )
+                        }
+                    }
+                }
+
+                else -> {}
             }
-        )
+        }
+        return
     }
 
+    // =========================================================================
+    // STAGE 3: AFTER SWIPING UP (OR APP LOCK SCREEN)
+    // - Fingerprint icon is HIDDEN by default (`hideUntilTouched = true`),
+    //   and only appears + plays optical animation when the user places their finger on it!
+    // - Automatic Face Detection (`isFaceAutoScanning = true`) is active at the top!
+    // - Shows PIN (4/6 digit), Pattern, or Mixed Password!
+    // - Swiping down on the Phone Lock Screen returns to the Wallpaper Lock Screen!
+    // =========================================================================
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
-            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .pointerInput(isPhoneLockScreen) {
+                if (isPhoneLockScreen) {
+                    detectVerticalDragGestures { _, dragAmount ->
+                        if (dragAmount > 32f) {
+                            lockStage = PhoneLockScreenStage.WALLPAPER_LOCK
+                        }
+                    }
+                }
+            }
     ) {
+        if (isPhoneLockScreen) {
+            if (customWallpaperBitmap != null) {
+                Image(
+                    bitmap = customWallpaperBitmap,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                Image(
+                    painter = painterResource(id = R.drawable.default_lock_wallpaper),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color(0xCC0F172A),
+                                Color(0xEB0F172A),
+                                Color(0xF50F172A)
+                            )
+                        )
+                    )
+            )
+        }
+
+        val isDarkOverlay = isPhoneLockScreen
+        val primaryTextColor = if (isDarkOverlay) Color.White else MaterialTheme.colorScheme.onBackground
+        val secondaryTextColor = if (isDarkOverlay) Color.White.copy(alpha = 0.78f) else MaterialTheme.colorScheme.onSurfaceVariant
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.safeDrawing)
                 .widthIn(max = 480.dp)
                 .align(Alignment.Center)
                 .verticalScroll(rememberScrollState())
@@ -194,76 +538,77 @@ fun LockScreenOverlayContent(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // Top section: Either Classic Phone Lock Screen Clock OR App Icon Header
+            // Top Section: Automatic Face Detection status & App/Screen Header
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.Lock,
-                            contentDescription = null,
-                            tint = ClassicPrimaryBlue,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = if (isPhoneLockScreen) "Phone Screen Locked" else "App Lock",
-                            style = MaterialTheme.typography.titleSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-
-                    if (onExitToHomeScreen != null) {
-                        IconButton(
-                            onClick = onExitToHomeScreen,
-                            modifier = Modifier.testTag("close_lock_overlay_button")
-                        ) {
+                if (!isPhoneLockScreen) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Close",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = null,
+                                tint = ClassicPrimaryBlue,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "App Lock",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = secondaryTextColor
                             )
                         }
+
+                        if (onExitToHomeScreen != null) {
+                            IconButton(
+                                onClick = onExitToHomeScreen,
+                                modifier = Modifier.testTag("close_lock_overlay_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Close",
+                                    tint = secondaryTextColor
+                                )
+                            }
+                        }
                     }
+                } else {
+                    Spacer(modifier = Modifier.height(16.dp))
                 }
 
-                Spacer(modifier = Modifier.height(6.dp))
+                // Automatic Face Detection Icon (Pulses automatically after swipe up)
+                Box(
+                    modifier = Modifier
+                        .clickable { onTriggerHardwareBiometric() }
+                        .padding(vertical = 6.dp)
+                        .testTag("quick_face_unlock_button"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    LockScreenFaceStatusIcon(
+                        isScanning = !isInCooldown && isFaceAutoScanning,
+                        tint = if (isDarkOverlay) Color.White else ClassicPrimaryBlue,
+                        modifier = Modifier.size(34.dp)
+                    )
+                }
 
-                if (isPhoneLockScreen) {
-                    // Classic Android Lock Screen Clock & Date
-                    Text(
-                        text = clockTimeStr,
-                        style = MaterialTheme.typography.displayLarge.copy(
-                            fontSize = 56.sp,
-                            fontWeight = FontWeight.Bold
-                        ),
-                        color = MaterialTheme.colorScheme.onBackground
-                    )
-                    Text(
-                        text = clockDateStr,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                } else {
+                Spacer(modifier = Modifier.height(8.dp))
+
+                if (!isPhoneLockScreen) {
                     NativeAppIconAvatar(
                         packageName = targetPackageName,
                         appName = targetAppName,
-                        size = 64.dp
+                        size = 58.dp
                     )
-
-                    Spacer(modifier = Modifier.height(10.dp))
-
+                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         text = targetAppName,
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = MaterialTheme.colorScheme.onBackground,
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = primaryTextColor,
                         textAlign = TextAlign.Center
                     )
                 }
@@ -273,7 +618,7 @@ fun LockScreenOverlayContent(
                 Text(
                     text = feedbackMessage,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = if (isErrorFeedback || isInCooldown) ClassicDangerRed else MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (isErrorFeedback || isInCooldown) Color(0xFFF87171) else secondaryTextColor,
                     textAlign = TextAlign.Center
                 )
 
@@ -282,14 +627,14 @@ fun LockScreenOverlayContent(
                     Text(
                         text = "Wrong attempts: ${vaultState.failedAttempts % 5} / 5",
                         style = MaterialTheme.typography.labelMedium,
-                        color = ClassicDangerRed
+                        color = Color(0xFFF87171)
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(10.dp))
 
-            // Middle section: Cooldown timer OR PIN / Pattern / Mixed input
+            // Middle Section: Cooldown Timer OR Configured Lock Input (PIN / Pattern / Mixed)
             if (isInCooldown) {
                 ClassicCooldownCard(
                     remainingSeconds = remainingSeconds,
@@ -300,7 +645,6 @@ fun LockScreenOverlayContent(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    // Optional switcher if user wants to switch between PIN / Pattern / Mixed
                     val availableTabs = buildList {
                         if (vaultState.pinHash.isNotEmpty() || currentInputTab == ActiveInputTab.PIN) add(ActiveInputTab.PIN to "PIN")
                         if (vaultState.patternHash.isNotEmpty() || currentInputTab == ActiveInputTab.PATTERN) add(ActiveInputTab.PATTERN to "Pattern")
@@ -310,7 +654,7 @@ fun LockScreenOverlayContent(
                     if (availableTabs.size > 1) {
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            modifier = Modifier.padding(bottom = 12.dp)
+                            modifier = Modifier.padding(bottom = 10.dp)
                         ) {
                             availableTabs.forEach { (tab, label) ->
                                 FilterChip(
@@ -318,32 +662,12 @@ fun LockScreenOverlayContent(
                                     onClick = { currentInputTab = tab },
                                     label = { Text(label) },
                                     colors = FilterChipDefaults.filterChipColors(
-                                        selectedContainerColor = ClassicPrimaryBlue.copy(alpha = 0.14f),
-                                        selectedLabelColor = ClassicPrimaryBlue
+                                        selectedContainerColor = ClassicPrimaryBlue.copy(alpha = 0.22f),
+                                        selectedLabelColor = if (isDarkOverlay) Color.White else ClassicPrimaryBlue,
+                                        labelColor = secondaryTextColor
                                     )
                                 )
                             }
-                        }
-                    }
-
-                    // Face Unlock button if enabled
-                    if (vaultState.faceUnlockEnabled) {
-                        OutlinedButton(
-                            onClick = { showFaceCameraDialog = true },
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(1.dp, ClassicPrimaryBlue.copy(alpha = 0.5f)),
-                            modifier = Modifier
-                                .padding(bottom = 12.dp)
-                                .testTag("quick_face_unlock_button")
-                        ) {
-                            Icon(
-                                Icons.Default.Face,
-                                contentDescription = "Face Lock",
-                                tint = ClassicPrimaryBlue,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Unlock with Face Scan", color = ClassicPrimaryBlue)
                         }
                     }
 
@@ -353,25 +677,26 @@ fun LockScreenOverlayContent(
                             Row(
                                 horizontalArrangement = Arrangement.spacedBy(14.dp),
                                 verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.padding(vertical = 10.dp)
+                                modifier = Modifier.padding(vertical = 8.dp)
                             ) {
                                 for (i in 0 until pinLen) {
                                     val filled = i < enteredPin.length
+                                    val dotColor = if (isDarkOverlay) Color.White else ClassicPrimaryBlue
                                     Box(
                                         modifier = Modifier
                                             .size(16.dp)
                                             .clip(CircleShape)
-                                            .background(if (filled) ClassicPrimaryBlue else Color.Transparent)
+                                            .background(if (filled) dotColor else Color.Transparent)
                                             .border(
                                                 width = 2.dp,
-                                                color = if (filled) ClassicPrimaryBlue else MaterialTheme.colorScheme.outline,
+                                                color = if (filled) dotColor else secondaryTextColor,
                                                 shape = CircleShape
                                             )
                                     )
                                 }
                             }
 
-                            Spacer(modifier = Modifier.height(10.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
 
                             ClassicNumericPad(
                                 onDigit = { digit ->
@@ -411,6 +736,7 @@ fun LockScreenOverlayContent(
                         ActiveInputTab.PATTERN -> {
                             PatternLockSection(
                                 hintText = "Draw your unlock pattern",
+                                hintColor = secondaryTextColor,
                                 showTestButtons = false,
                                 onPatternComplete = { nodes ->
                                     if (nodes.size < 4) {
@@ -513,14 +839,14 @@ fun LockScreenOverlayContent(
                 }
             }
 
-            // Bottom section: In-Display Ultrasonic Fingerprint Sensor right at the bottom of the display!
-            if (!isInCooldown && (vaultState.fingerprintEnabled || vaultState.biometricEnabled)) {
+            // Bottom Section:
+            // After swiping up (or on App Lock), the fingerprint icon is HIDDEN by default (`hideUntilTouched = true`).
+            // As soon as the user touches this bottom zone, the fingerprint icon + optical animation immediately appear & play!
+            if (!isInCooldown && (vaultState.fingerprintEnabled || vaultState.faceUnlockEnabled || vaultState.biometricEnabled)) {
                 InDisplayFingerprintSensorZone(
-                    label = "Touch & hold in-display fingerprint sensor or tap to use phone fingerprint",
-                    onVerifiedSuccess = {
-                        vibrateDevice(context, 45L)
-                        onAuthSuccess("FINGERPRINT")
-                    },
+                    label = "",
+                    hideUntilTouched = true,
+                    onDarkBackground = isDarkOverlay,
                     onTriggerSystemBiometric = onTriggerHardwareBiometric
                 )
             } else {
@@ -598,6 +924,7 @@ private fun ClassicCooldownCard(
 fun PatternLockSection(
     onPatternComplete: (List<Int>) -> Unit,
     hintText: String = "Draw unlock pattern",
+    hintColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     showTestButtons: Boolean = false
 ) {
     val selectedNodes = remember { mutableStateListOf<Int>() }
@@ -634,7 +961,7 @@ fun PatternLockSection(
         Text(
             text = hintText,
             style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = hintColor,
             textAlign = TextAlign.Center
         )
 

@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CameraFront
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.Fingerprint
@@ -55,7 +54,6 @@ import com.example.data.SecurityVaultState
 import com.example.system.BiometricAuthHelper
 import com.example.system.BiometricModality
 import com.example.system.SystemSecurityCapabilities
-import com.example.ui.components.CameraFaceScannerDialog
 import com.example.ui.components.InDisplayFingerprintSensorZone
 import com.example.ui.theme.ClassicDangerRed
 import com.example.ui.theme.ClassicPrimaryBlue
@@ -83,7 +81,6 @@ fun AuthAndCooldownScreen(
         BiometricAuthHelper.getDiagnostics(context)
     }
 
-    var showFaceEnrollDialog by remember { mutableStateOf(false) }
     var biometricPromptFeedback by remember { mutableStateOf<String?>(null) }
     var isFeedbackSuccess by remember { mutableStateOf(true) }
 
@@ -100,23 +97,6 @@ fun AuthAndCooldownScreen(
         nowMs = System.currentTimeMillis()
     }
 
-    if (showFaceEnrollDialog) {
-        CameraFaceScannerDialog(
-            isEnrollmentMode = true,
-            onDismiss = { showFaceEnrollDialog = false },
-            onFaceScanSuccess = {
-                showFaceEnrollDialog = false
-                onUpdateBiometricSettings(
-                    true,
-                    vaultState.fingerprintEnabled,
-                    true
-                )
-                biometricPromptFeedback = "Face Lock registered & enabled."
-                isFeedbackSuccess = true
-            }
-        )
-    }
-
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -124,7 +104,7 @@ fun AuthAndCooldownScreen(
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // 1. AndroidX BiometricPrompt Status & Live Verification Banner
+        // 1. Real Android Hardware BiometricPrompt Status Banner
         item {
             Surface(
                 color = MaterialTheme.colorScheme.surface,
@@ -168,7 +148,7 @@ fun AuthAndCooldownScreen(
                         Spacer(modifier = Modifier.width(12.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Android BiometricPrompt API",
+                                text = "100% Real System BiometricPrompt",
                                 style = MaterialTheme.typography.titleMedium,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
@@ -234,7 +214,7 @@ fun AuthAndCooldownScreen(
                                 onAuthenticateWithBiometricPrompt(
                                     BiometricModality.FINGERPRINT_AND_FACE,
                                     { msg ->
-                                        biometricPromptFeedback = "$msg • Fingerprint & Face enabled!"
+                                        biometricPromptFeedback = "$msg • Hardware Fingerprint & Face enabled!"
                                         isFeedbackSuccess = true
                                         onUpdateBiometricSettings(true, true, true)
                                     },
@@ -256,7 +236,7 @@ fun AuthAndCooldownScreen(
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Verify BiometricPrompt", fontWeight = FontWeight.SemiBold)
+                            Text("Verify Hardware Biometrics", fontWeight = FontWeight.SemiBold)
                         }
 
                         if (biometricDiagnostics.needsOsEnrollment) {
@@ -362,7 +342,7 @@ fun AuthAndCooldownScreen(
             }
         }
 
-        // 3. Fingerprint Authentication (BiometricPrompt + Bottom In-Display Sensor)
+        // 3. Real Hardware Fingerprint Authentication
         item {
             Surface(
                 color = MaterialTheme.colorScheme.surface,
@@ -403,9 +383,9 @@ fun AuthAndCooldownScreen(
                                 )
                                 Text(
                                     text = if (vaultState.fingerprintEnabled) {
-                                        "Enabled (BiometricPrompt & In-Display Sensor)"
+                                        "Active • Uses phone's real hardware fingerprint sensor"
                                     } else {
-                                        "Use system BiometricPrompt or in-display sensor"
+                                        "Verify with your phone's registered fingerprint"
                                     },
                                     style = MaterialTheme.typography.bodySmall,
                                     color = if (vaultState.fingerprintEnabled) {
@@ -420,11 +400,11 @@ fun AuthAndCooldownScreen(
                         Switch(
                             checked = vaultState.fingerprintEnabled,
                             onCheckedChange = { enabled ->
-                                if (enabled && biometricDiagnostics.canAuthenticateAny) {
+                                if (enabled) {
                                     onAuthenticateWithBiometricPrompt(
                                         BiometricModality.FINGERPRINT,
                                         { msg ->
-                                            biometricPromptFeedback = "Fingerprint verified via $msg"
+                                            biometricPromptFeedback = "Hardware Fingerprint verified ($msg)"
                                             isFeedbackSuccess = true
                                             onUpdateBiometricSettings(
                                                 true,
@@ -432,18 +412,15 @@ fun AuthAndCooldownScreen(
                                                 vaultState.faceUnlockEnabled
                                             )
                                         },
-                                        {
-                                            onUpdateBiometricSettings(
-                                                true,
-                                                true,
-                                                vaultState.faceUnlockEnabled
-                                            )
+                                        { fallbackMsg ->
+                                            biometricPromptFeedback = fallbackMsg
+                                            isFeedbackSuccess = false
                                         }
                                     )
                                 } else {
                                     onUpdateBiometricSettings(
-                                        enabled || vaultState.faceUnlockEnabled,
-                                        enabled,
+                                        vaultState.faceUnlockEnabled,
+                                        false,
                                         vaultState.faceUnlockEnabled
                                     )
                                 }
@@ -459,21 +436,13 @@ fun AuthAndCooldownScreen(
                     Spacer(modifier = Modifier.height(10.dp))
 
                     InDisplayFingerprintSensorZone(
-                        label = "Touch & hold the bottom sensor to register your thumb, or tap to trigger BiometricPrompt",
-                        onVerifiedSuccess = {
-                            onUpdateBiometricSettings(
-                                true,
-                                true,
-                                vaultState.faceUnlockEnabled
-                            )
-                            biometricPromptFeedback = "In-display fingerprint sensor registered & active!"
-                            isFeedbackSuccess = true
-                        },
+                        label = "Place your finger on the blank sensor spot below — the Fingerprint icon & animation will play on touch",
+                        hideUntilTouched = true,
                         onTriggerSystemBiometric = {
                             onAuthenticateWithBiometricPrompt(
                                 BiometricModality.FINGERPRINT,
                                 { msg ->
-                                    biometricPromptFeedback = "Fingerprint authenticated ($msg)"
+                                    biometricPromptFeedback = "Hardware Fingerprint authenticated ($msg)"
                                     isFeedbackSuccess = true
                                     onUpdateBiometricSettings(
                                         true,
@@ -492,7 +461,7 @@ fun AuthAndCooldownScreen(
             }
         }
 
-        // 4. Face Authentication (BiometricPrompt Face + Live Camera Face Scan)
+        // 4. Real Hardware Face Authentication (OS BiometricPrompt Face Unlock)
         item {
             Surface(
                 color = MaterialTheme.colorScheme.surface,
@@ -533,9 +502,9 @@ fun AuthAndCooldownScreen(
                                 )
                                 Text(
                                     text = if (vaultState.faceUnlockEnabled) {
-                                        "Face Lock Active (BiometricPrompt + Camera)"
+                                        "Active • Uses phone's real OS Face Unlock"
                                     } else {
-                                        "Authenticate with BiometricPrompt Face or Camera Scan"
+                                        "Verify with your phone's system Face Unlock"
                                     },
                                     style = MaterialTheme.typography.bodySmall,
                                     color = if (vaultState.faceUnlockEnabled) {
@@ -551,25 +520,22 @@ fun AuthAndCooldownScreen(
                             checked = vaultState.faceUnlockEnabled,
                             onCheckedChange = { enabled ->
                                 if (enabled) {
-                                    if (biometricDiagnostics.canAuthenticateAny) {
-                                        onAuthenticateWithBiometricPrompt(
-                                            BiometricModality.FACE,
-                                            { msg ->
-                                                biometricPromptFeedback = "Face Lock verified via $msg"
-                                                isFeedbackSuccess = true
-                                                onUpdateBiometricSettings(
-                                                    true,
-                                                    vaultState.fingerprintEnabled,
-                                                    true
-                                                )
-                                            },
-                                            {
-                                                showFaceEnrollDialog = true
-                                            }
-                                        )
-                                    } else {
-                                        showFaceEnrollDialog = true
-                                    }
+                                    onAuthenticateWithBiometricPrompt(
+                                        BiometricModality.FACE,
+                                        { msg ->
+                                            biometricPromptFeedback = "System Face Unlock verified ($msg)"
+                                            isFeedbackSuccess = true
+                                            onUpdateBiometricSettings(
+                                                true,
+                                                vaultState.fingerprintEnabled,
+                                                true
+                                            )
+                                        },
+                                        { fallbackMsg ->
+                                            biometricPromptFeedback = fallbackMsg
+                                            isFeedbackSuccess = false
+                                        }
+                                    )
                                 } else {
                                     onUpdateBiometricSettings(
                                         vaultState.fingerprintEnabled,
@@ -605,8 +571,9 @@ fun AuthAndCooldownScreen(
                                             true
                                         )
                                     },
-                                    {
-                                        showFaceEnrollDialog = true
+                                    { fallbackMsg ->
+                                        biometricPromptFeedback = fallbackMsg
+                                        isFeedbackSuccess = false
                                     }
                                 )
                             },
@@ -622,11 +589,11 @@ fun AuthAndCooldownScreen(
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("System Face Auth", fontWeight = FontWeight.SemiBold)
+                            Text("Verify System Face", fontWeight = FontWeight.SemiBold)
                         }
 
                         OutlinedButton(
-                            onClick = { showFaceEnrollDialog = true },
+                            onClick = onOpenOsBiometricEnrollment,
                             shape = RoundedCornerShape(12.dp),
                             border = BorderStroke(1.dp, ClassicPrimaryBlue.copy(alpha = 0.5f)),
                             modifier = Modifier
@@ -634,14 +601,14 @@ fun AuthAndCooldownScreen(
                                 .testTag("scan_register_face_button")
                         ) {
                             Icon(
-                                Icons.Default.CameraFront,
+                                Icons.Default.Settings,
                                 contentDescription = null,
                                 tint = ClassicPrimaryBlue,
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "Camera Face Scan",
+                                text = "Phone Face Settings",
                                 color = ClassicPrimaryBlue,
                                 fontWeight = FontWeight.SemiBold
                             )

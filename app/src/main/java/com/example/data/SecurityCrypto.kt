@@ -39,15 +39,14 @@ data class SecurityVaultState(
     val preventUninstallShield: Boolean = true,
     val relockOnScreenOff: Boolean = true,
     val phoneScreenLockEnabled: Boolean = true,
+    val intruderSelfieEnabled: Boolean = true,
+    val notificationPrivacyEnabled: Boolean = true,
     val lastBootRestoredTimestamp: Long = 0L,
     val bootRestoreCount: Int = 0
 )
 
 /**
  * Direct-Boot Aware Credential & Cooldown Storage.
- * No default password is pre-set on install; the user chooses 4-digit PIN, 6-digit PIN,
- * Pattern, or Mixed Alphanumeric Password on first launch. Once set, it is hashed with
- * SHA-256 in DeviceProtectedStorageContext so it survives phone restarts.
  */
 object SecurityCrypto {
     private const val PREFS_NAME = "aegis_native_vault_prefs_v2"
@@ -77,10 +76,30 @@ object SecurityCrypto {
 class SecurityPreferencesManager(context: Context) {
     private val prefs: SharedPreferences = SecurityCrypto.getPrefs(context)
 
+    @Volatile
+    private var cachedLockedPackages: Set<String> =
+        prefs.getStringSet(KEY_LOCKED_PACKAGES_SET, emptySet())?.toSet() ?: emptySet()
+
     private val _state = MutableStateFlow(readState())
     val state: StateFlow<SecurityVaultState> = _state.asStateFlow()
 
+    // Keep in-memory state synced automatically on preference changes — zero polling or disk lag!
+    private val prefChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == KEY_LOCKED_PACKAGES_SET) {
+            cachedLockedPackages =
+                prefs.getStringSet(KEY_LOCKED_PACKAGES_SET, emptySet())?.toSet() ?: emptySet()
+        } else {
+            _state.value = readState()
+        }
+    }
+
+    init {
+        prefs.registerOnSharedPreferenceChangeListener(prefChangeListener)
+    }
+
     fun refreshState() {
+        cachedLockedPackages =
+            prefs.getStringSet(KEY_LOCKED_PACKAGES_SET, emptySet())?.toSet() ?: emptySet()
         _state.value = readState()
     }
 
@@ -116,6 +135,8 @@ class SecurityPreferencesManager(context: Context) {
             preventUninstallShield = prefs.getBoolean(KEY_PREVENT_UNINSTALL, true),
             relockOnScreenOff = prefs.getBoolean(KEY_RELOCK_SCREEN_OFF, true),
             phoneScreenLockEnabled = prefs.getBoolean(KEY_PHONE_SCREEN_LOCK, true),
+            intruderSelfieEnabled = prefs.getBoolean(KEY_INTRUDER_SELFIE, true),
+            notificationPrivacyEnabled = prefs.getBoolean(KEY_NOTIFICATION_PRIVACY, true),
             lastBootRestoredTimestamp = prefs.getLong(KEY_LAST_BOOT_TIMESTAMP, 0L),
             bootRestoreCount = prefs.getInt(KEY_BOOT_RESTORE_COUNT, 0)
         )
@@ -123,6 +144,16 @@ class SecurityPreferencesManager(context: Context) {
 
     fun setPhoneScreenLockEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_PHONE_SCREEN_LOCK, enabled).apply()
+        refreshState()
+    }
+
+    fun setIntruderSelfieEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_INTRUDER_SELFIE, enabled).apply()
+        refreshState()
+    }
+
+    fun setNotificationPrivacyEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_NOTIFICATION_PRIVACY, enabled).apply()
         refreshState()
     }
 
@@ -195,9 +226,6 @@ class SecurityPreferencesManager(context: Context) {
         refreshState()
     }
 
-    /**
-     * Every 5th failed attempt triggers a fixed 30-second cooldown persisted to disk.
-     */
     fun recordFailedAttempt(nowEpochMs: Long = System.currentTimeMillis()): Pair<Int, Boolean> {
         val newCount = prefs.getInt(KEY_FAILED_ATTEMPTS, 0) + 1
         val triggeredCooldown = (newCount % 5 == 0)
@@ -274,11 +302,12 @@ class SecurityPreferencesManager(context: Context) {
     }
 
     fun syncLockedPackageSet(packages: Set<String>) {
+        cachedLockedPackages = packages.toSet()
         prefs.edit().putStringSet(KEY_LOCKED_PACKAGES_SET, packages).apply()
     }
 
     fun getLockedPackageSet(): Set<String> {
-        return prefs.getStringSet(KEY_LOCKED_PACKAGES_SET, emptySet()) ?: emptySet()
+        return cachedLockedPackages
     }
 
     companion object {
@@ -299,6 +328,8 @@ class SecurityPreferencesManager(context: Context) {
         private const val KEY_PREVENT_UNINSTALL = "prevent_uninstall_shield"
         private const val KEY_RELOCK_SCREEN_OFF = "relock_on_screen_off"
         private const val KEY_PHONE_SCREEN_LOCK = "phone_screen_lock_enabled"
+        private const val KEY_INTRUDER_SELFIE = "intruder_selfie_enabled"
+        private const val KEY_NOTIFICATION_PRIVACY = "notification_privacy_enabled"
         private const val KEY_LAST_BOOT_TIMESTAMP = "last_boot_restored_timestamp"
         private const val KEY_BOOT_RESTORE_COUNT = "boot_restore_count"
         private const val KEY_LOCKED_PACKAGES_SET = "locked_packages_direct_boot_set"

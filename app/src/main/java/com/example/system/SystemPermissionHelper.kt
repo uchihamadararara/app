@@ -1,5 +1,6 @@
 package com.example.system
 
+import android.Manifest
 import android.app.AppOpsManager
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
@@ -8,13 +9,20 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.os.Process
 import android.provider.Settings
+import android.text.TextUtils
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricManager.Authenticators
+import androidx.core.content.ContextCompat
 
 data class SystemSecurityCapabilities(
     val isDeviceAdminActive: Boolean = false,
+    val isAccessibilityServiceEnabled: Boolean = false,
+    val isNotificationListenerEnabled: Boolean = false,
+    val isIgnoringBatteryOptimizations: Boolean = false,
+    val hasCameraPermission: Boolean = false,
     val canDrawOverlays: Boolean = false,
     val hasUsageStatsAccess: Boolean = false,
     val isBootReceiverEnabled: Boolean = true,
@@ -44,7 +52,7 @@ object SystemPermissionHelper {
             putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, getDeviceAdminComponent(context))
             putExtra(
                 DevicePolicyManager.EXTRA_ADD_EXPLANATION,
-                "Enable Aegis Device Administrator to prevent unauthorized uninstallation of Aegis Lock and protect your locked apps."
+                "Enable Aegis Device Administrator to prevent unauthorized uninstallation of Aegis Lock and allow instant screen locking."
             )
         }
     }
@@ -56,11 +64,84 @@ object SystemPermissionHelper {
         }
     }
 
+    fun isAccessibilityServiceEnabled(context: Context): Boolean {
+        val expectedComponentName = ComponentName(context, AegisAccessibilityService::class.java)
+        val enabledServicesSetting = Settings.Secure.getString(
+            context.contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: return false
+
+        val colonSplitter = TextUtils.SimpleStringSplitter(':')
+        colonSplitter.setString(enabledServicesSetting)
+        while (colonSplitter.hasNext()) {
+            val componentNameString = colonSplitter.next()
+            val enabledComponent = ComponentName.unflattenFromString(componentNameString)
+            if (enabledComponent != null && enabledComponent == expectedComponentName) {
+                return true
+            }
+        }
+        return false
+    }
+
+    fun buildAccessibilitySettingsIntent(): Intent {
+        return Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+    }
+
+    fun isNotificationListenerEnabled(context: Context): Boolean {
+        val expectedComponent = ComponentName(context, AegisNotificationListenerService::class.java)
+        val flat = Settings.Secure.getString(
+            context.contentResolver,
+            "enabled_notification_listeners"
+        ) ?: return false
+        val colonSplitter = TextUtils.SimpleStringSplitter(':')
+        colonSplitter.setString(flat)
+        while (colonSplitter.hasNext()) {
+            val cn = ComponentName.unflattenFromString(colonSplitter.next())
+            if (cn != null && cn == expectedComponent) {
+                return true
+            }
+        }
+        return false
+    }
+
+    fun buildNotificationListenerSettingsIntent(): Intent {
+        return Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+    }
+
+    fun isIgnoringBatteryOptimizations(context: Context): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+        } else {
+            true
+        }
+    }
+
+    @Suppress("BatteryLife")
+    fun buildIgnoreBatteryOptimizationsIntent(context: Context): Intent {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Intent(
+                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:${context.packageName}")
+            )
+        } else {
+            Intent(Settings.ACTION_SETTINGS)
+        }
+    }
+
+    fun hasCameraPermission(context: Context): Boolean {
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
     /**
-     * Uses DevicePolicyManager.lockNow() (if Device Admin is active) to lock the hardware screen
-     * and launches the full-screen Aegis Phone Lock Screen (with showWhenLocked = true).
+     * Marks the Home Screen Gate as locked, launches the Phone Unlock Gate screen,
+     * and calls DevicePolicyManager.lockNow() if Device Admin is active.
      */
     fun lockPhoneScreenNow(context: Context) {
+        AppLockMonitorService.setHomeScreenGatePending(true)
         val lockScreenIntent = Intent(context, LockOverlayActivity::class.java).apply {
             addFlags(
                 Intent.FLAG_ACTIVITY_NEW_TASK or
@@ -68,7 +149,7 @@ object SystemPermissionHelper {
                     Intent.FLAG_ACTIVITY_SINGLE_TOP
             )
             putExtra(LockOverlayActivity.EXTRA_TARGET_PACKAGE, context.packageName)
-            putExtra(LockOverlayActivity.EXTRA_TARGET_APP_NAME, "Phone Lock Screen")
+            putExtra(LockOverlayActivity.EXTRA_TARGET_APP_NAME, "Phone Unlock Gate (Home Screen)")
             putExtra(LockOverlayActivity.EXTRA_IS_PHONE_LOCK_SCREEN, true)
         }
         runCatching {
@@ -154,18 +235,22 @@ object SystemPermissionHelper {
 
         val bioLabel = when (weakResult) {
             BiometricManager.BIOMETRIC_SUCCESS ->
-                "Hardware Ready (Fingerprint & Face Biometrics Enrolled)"
+                "Real Phone Biometrics Enrolled & Ready (Fingerprint / Face)"
             BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED ->
-                "Sensor Present • No Fingerprint/Face Enrolled in OS Settings"
+                "No Fingerprint/Face Enrolled in Phone Settings Yet"
             BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE ->
-                "No Biometric Sensor Detected on Emulator/Device (Interactive Biometric Verification Active)"
+                "No Hardware Biometric Sensor Detected on This Device"
             BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE ->
-                "Biometric Hardware Busy / Temporarily Unavailable"
-            else -> "Biometric API Ready (Fallback + Hardware Mode)"
+                "Biometric Hardware Temporarily Busy"
+            else -> "Biometric Sensor Status ($weakResult)"
         }
 
         return SystemSecurityCapabilities(
             isDeviceAdminActive = isDeviceAdminActive(context),
+            isAccessibilityServiceEnabled = isAccessibilityServiceEnabled(context),
+            isNotificationListenerEnabled = isNotificationListenerEnabled(context),
+            isIgnoringBatteryOptimizations = isIgnoringBatteryOptimizations(context),
+            hasCameraPermission = hasCameraPermission(context),
             canDrawOverlays = canDrawOverlays(context),
             hasUsageStatsAccess = hasUsageStatsPermission(context),
             isBootReceiverEnabled = isBootReceiverEnabled(context),

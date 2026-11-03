@@ -11,6 +11,7 @@ import com.example.data.LockedAppEntity
 import com.example.data.SecurityLogEntity
 import com.example.data.SecurityPreferencesManager
 import com.example.data.SecurityVaultState
+import com.example.system.AegisNotificationListenerService
 import com.example.system.BootCompletedReceiver
 import com.example.system.LockOverlayActivity
 import com.example.system.SystemPermissionHelper
@@ -85,6 +86,47 @@ class AegisViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             "Phone Lock Screen turned off."
         }
+    }
+
+    fun toggleIntruderSelfie(enabled: Boolean) {
+        prefsManager.setIntruderSelfieEnabled(enabled)
+        _statusBannerMessage.value = if (enabled) {
+            "Intruder Selfie enabled: Front camera will snap a photo on wrong password attempts."
+        } else {
+            "Intruder Selfie turned off."
+        }
+    }
+
+    fun toggleNotificationPrivacy(enabled: Boolean) {
+        prefsManager.setNotificationPrivacyEnabled(enabled)
+        _statusBannerMessage.value = if (enabled) {
+            "Locked App Notification Shield enabled: Only 'New notification' will be shown."
+        } else {
+            "Locked App Notification Shield turned off."
+        }
+    }
+
+    fun sendSampleMaskedNotification() {
+        val sampleLockedApp = allApps.value.firstOrNull { it.isLocked }
+            ?: LockedAppEntity(
+                packageName = "com.whatsapp",
+                appName = "WhatsApp",
+                category = "Social & Mail",
+                isLocked = true
+            )
+        AegisNotificationListenerService.postMaskedNewNotification(
+            context = appContext,
+            targetPackage = sampleLockedApp.packageName,
+            targetAppName = sampleLockedApp.appName
+        )
+        viewModelScope.launch {
+            repository.addCustomLog(
+                eventType = "NOTIFICATION_MASKED",
+                title = sampleLockedApp.appName,
+                details = "Hidden private notification content • Displayed only 'New notification'"
+            )
+        }
+        _statusBannerMessage.value = "Posted '${sampleLockedApp.appName}: New notification' to status bar."
     }
 
     fun lockPhoneScreenNow() {

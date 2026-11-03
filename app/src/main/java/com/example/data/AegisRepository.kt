@@ -2,10 +2,10 @@ package com.example.data
 
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
+import java.io.File
 
 class AegisRepository(
     private val context: Context,
@@ -132,13 +132,7 @@ class AegisRepository(
             }
         }
 
-        val existingInDb = dao.getAllAppsOnce()
-        if (existingInDb.isEmpty()) {
-            dao.insertAppsIgnoreExisting(discovered.values.toList())
-        } else {
-            dao.insertAppsIgnoreExisting(discovered.values.toList())
-        }
-
+        dao.insertAppsIgnoreExisting(discovered.values.toList())
         refreshDirectBootLockedSet()
     }
 
@@ -203,11 +197,12 @@ class AegisRepository(
         success: Boolean,
         targetAppName: String,
         targetPackage: String,
-        authMethod: String
-    ): Pair<Int, Boolean> {
+        authMethod: String,
+        photoPath: String? = null
+    ): Triple<Int, Boolean, Int> {
         return if (success) {
             prefsManager.resetFailedAttempts()
-            dao.insertSecurityLog(
+            val rowId = dao.insertSecurityLog(
                 SecurityLogEntity(
                     eventType = "APP_UNLOCKED",
                     targetAppName = targetAppName,
@@ -216,41 +211,63 @@ class AegisRepository(
                     attemptNumber = 0,
                     details = "Verified via $authMethod. Cooldown counter reset to 0/5."
                 )
-            )
-            0 to false
+            ).toInt()
+            Triple(0, false, rowId)
         } else {
             val (attempts, triggeredCooldown) = prefsManager.recordFailedAttempt()
-            dao.insertSecurityLog(
+            val baseDetails = if (triggeredCooldown) {
+                "CRITICAL: 5th failed attempt ($authMethod) on $targetAppName! Enforcing mandatory 30-second system lockout."
+            } else {
+                "Invalid $authMethod attempt ($attempts/5 before 30s lockout) on $targetAppName."
+            }
+            val finalDetails = if (!photoPath.isNullOrBlank()) {
+                "$baseDetails • Intruder selfie captured."
+            } else {
+                baseDetails
+            }
+            val rowId = dao.insertSecurityLog(
                 SecurityLogEntity(
                     eventType = if (triggeredCooldown) "COOLDOWN_TRIGGERED" else "FAILED_ATTEMPT",
                     targetAppName = targetAppName,
                     targetPackage = targetPackage,
                     authMethod = authMethod,
                     attemptNumber = attempts,
-                    details = if (triggeredCooldown) {
-                        "CRITICAL: 5th failed attempt ($authMethod) on $targetAppName! Enforcing mandatory 30-second system lockout."
-                    } else {
-                        "Invalid $authMethod attempt ($attempts/5 before 30s lockout) on $targetAppName."
-                    }
+                    details = finalDetails,
+                    photoPath = photoPath
                 )
-            )
-            attempts to triggeredCooldown
+            ).toInt()
+            Triple(attempts, triggeredCooldown, rowId)
         }
     }
 
-    suspend fun addCustomLog(eventType: String, title: String, details: String) {
+    suspend fun attachIntruderSelfieToLog(logId: Int, photoPath: String, baseDetails: String) {
+        dao.attachIntruderPhotoToLog(
+            id = logId,
+            photoPath = photoPath,
+            details = "$baseDetails • Intruder selfie captured."
+        )
+    }
+
+    suspend fun addCustomLog(eventType: String, title: String, details: String, photoPath: String? = null) {
         dao.insertSecurityLog(
             SecurityLogEntity(
                 eventType = eventType,
                 targetAppName = title,
                 targetPackage = context.packageName,
                 authMethod = "SYSTEM",
-                details = details
+                details = details,
+                photoPath = photoPath
             )
         )
     }
 
-    suspend fun clearLogs() {
+    suspend fun clearLogs() = withContext(Dispatchers.IO) {
+        runCatching {
+            val dir = File(SecurityCrypto.getDeviceProtectedContext(context).filesDir, "intruder_selfies")
+            if (dir.exists()) {
+                dir.listFiles()?.forEach { it.delete() }
+            }
+        }
         dao.clearSecurityLogs()
     }
 

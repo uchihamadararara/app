@@ -27,11 +27,16 @@ import kotlinx.coroutines.launch
 /**
  * Full-Screen System Lock & Phone Lock Screen Activity.
  * - Renders directly over the Android Keyguard / Phone Lock Screen (setShowWhenLocked(true)).
- * - Also intercepts locked apps when launched in the foreground.
+ * - Re-evaluates target intent on onNewIntent() so every screen-off/screen-on cycle locks reliably.
  */
 class LockOverlayActivity : FragmentActivity() {
 
     private lateinit var repository: AegisRepository
+    private var currentTargetPackage by mutableStateOf("")
+    private var currentTargetAppName by mutableStateOf("")
+    private var currentIsPreviewMode by mutableStateOf(false)
+    private var currentIsPhoneLockScreen by mutableStateOf(false)
+    private var currentStartInAmbientAod by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -42,21 +47,19 @@ class LockOverlayActivity : FragmentActivity() {
         val prefs = SecurityPreferencesManager(applicationContext)
         repository = AegisRepository(applicationContext, db.aegisDao(), prefs)
 
-        val targetPackage = intent?.getStringExtra(EXTRA_TARGET_PACKAGE) ?: packageName
-        val isPreviewMode = intent?.getBooleanExtra(EXTRA_IS_PREVIEW_MODE, false) ?: false
-        val isPhoneLockScreen = intent?.getBooleanExtra(EXTRA_IS_PHONE_LOCK_SCREEN, false) ?: false
+        applyIntentExtras(intent)
 
         // Block back button from bypassing the lock screen
         onBackPressedDispatcher.addCallback(
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    if (isPreviewMode) {
+                    if (currentIsPreviewMode) {
                         finish()
-                    } else if (!isPhoneLockScreen) {
+                    } else if (!currentIsPhoneLockScreen) {
                         navigateToLauncherHome()
                     }
-                    // When isPhoneLockScreen == true, back button does nothing until unlocked!
+                    // When currentIsPhoneLockScreen == true, back button is completely blocked!
                 }
             }
         )
@@ -65,31 +68,62 @@ class LockOverlayActivity : FragmentActivity() {
             MyApplicationTheme(darkTheme = false) {
                 val vaultState by repository.vaultStateFlow.collectAsStateWithLifecycle()
                 val scope = rememberCoroutineScope()
-                var resolvedAppName by remember {
+                var resolvedAppName by remember(currentTargetPackage, currentIsPhoneLockScreen, currentTargetAppName) {
                     mutableStateOf(
-                        if (isPhoneLockScreen) {
+                        if (currentIsPhoneLockScreen) {
                             "Phone Lock Screen"
                         } else {
-                            intent?.getStringExtra(EXTRA_TARGET_APP_NAME) ?: targetPackage
+                            currentTargetAppName.ifBlank { currentTargetPackage }
                         }
                     )
                 }
 
-                LaunchedEffect(targetPackage, isPhoneLockScreen) {
-                    if (!isPhoneLockScreen) {
-                        val entity = db.aegisDao().getAppByPackage(targetPackage)
+                LaunchedEffect(currentTargetPackage, currentIsPhoneLockScreen) {
+                    if (!currentIsPhoneLockScreen && currentTargetPackage.isNotBlank()) {
+                        val entity = db.aegisDao().getAppByPackage(currentTargetPackage)
                         if (entity != null) {
                             resolvedAppName = entity.appName
                         }
-                        repository.recordInterceptedLaunch(targetPackage, resolvedAppName)
+                        repository.recordInterceptedLaunch(currentTargetPackage, resolvedAppName)
+                    }
+                }
+
+                fun handleFailedAttemptWithIntruderSelfie(authMethod: String) {
+                    scope.launch {
+                        val (attempts, triggeredCooldown, logId) = repository.logAuthEvent(
+                            success = false,
+                            targetAppName = resolvedAppName,
+                            targetPackage = currentTargetPackage,
+                            authMethod = authMethod
+                        )
+                        if (vaultState.intruderSelfieEnabled) {
+                            val baseDetails = if (triggeredCooldown) {
+                                "CRITICAL: 5th failed attempt ($authMethod) on $resolvedAppName! Enforcing mandatory 30-second system lockout."
+                            } else {
+                                "Invalid $authMethod attempt ($attempts/5 before 30s lockout) on $resolvedAppName."
+                            }
+                            IntruderSelfieHelper.captureIntruderSelfie(
+                                context = this@LockOverlayActivity,
+                                lifecycleOwner = this@LockOverlayActivity,
+                                targetAppName = resolvedAppName,
+                                attemptNumber = attempts,
+                                authMethod = authMethod,
+                                onPhotoSaved = { photoPath ->
+                                    scope.launch {
+                                        repository.attachIntruderSelfieToLog(logId, photoPath, baseDetails)
+                                    }
+                                }
+                            )
+                        }
                     }
                 }
 
                 LockScreenOverlayContent(
                     targetAppName = resolvedAppName,
-                    targetPackageName = targetPackage,
+                    targetPackageName = currentTargetPackage,
                     vaultState = vaultState,
-                    isPhoneLockScreen = isPhoneLockScreen,
+                    isPhoneLockScreen = currentIsPhoneLockScreen,
+                    startInAmbientAod = currentStartInAmbientAod,
                     onVerifyPin = { pin -> repository.prefsManager.verifyPin(pin) },
                     onVerifyPattern = { pattern -> repository.prefsManager.verifyPattern(pattern) },
                     onVerifyMixedPassword = { pwd -> repository.prefsManager.verifyMixedPassword(pwd) },
@@ -98,53 +132,43 @@ class LockOverlayActivity : FragmentActivity() {
                             repository.logAuthEvent(
                                 success = true,
                                 targetAppName = resolvedAppName,
-                                targetPackage = targetPackage,
+                                targetPackage = currentTargetPackage,
                                 authMethod = method
                             )
-                            if (!isPhoneLockScreen) {
-                                AppLockMonitorService.markPackageUnlockedForSession(targetPackage)
+                            if (currentIsPhoneLockScreen) {
+                                AppLockMonitorService.setHomeScreenGatePending(false)
+                            } else {
+                                AppLockMonitorService.markPackageUnlockedForSession(currentTargetPackage)
                             }
                             finish()
                         }
                     },
                     onAuthFailure = { method ->
-                        scope.launch {
-                            repository.logAuthEvent(
-                                success = false,
-                                targetAppName = resolvedAppName,
-                                targetPackage = targetPackage,
-                                authMethod = method
-                            )
-                        }
+                        handleFailedAttemptWithIntruderSelfie(method)
                     },
                     onTriggerHardwareBiometric = {
                         BiometricAuthHelper.authenticate(
                             activity = this@LockOverlayActivity,
-                            title = if (isPhoneLockScreen) "Unlock Phone" else "Unlock $resolvedAppName",
-                            subtitle = "Scan Fingerprint or Face",
+                            title = if (currentIsPhoneLockScreen) "Unlock Phone" else "Unlock $resolvedAppName",
+                            subtitle = "Use your phone's Fingerprint or Face Lock",
                             onSuccess = {
                                 scope.launch {
                                     repository.logAuthEvent(
                                         success = true,
                                         targetAppName = resolvedAppName,
-                                        targetPackage = targetPackage,
+                                        targetPackage = currentTargetPackage,
                                         authMethod = "BIOMETRIC"
                                     )
-                                    if (!isPhoneLockScreen) {
-                                        AppLockMonitorService.markPackageUnlockedForSession(targetPackage)
+                                    if (currentIsPhoneLockScreen) {
+                                        AppLockMonitorService.setHomeScreenGatePending(false)
+                                    } else {
+                                        AppLockMonitorService.markPackageUnlockedForSession(currentTargetPackage)
                                     }
                                     finish()
                                 }
                             },
                             onFailureAttempt = {
-                                scope.launch {
-                                    repository.logAuthEvent(
-                                        success = false,
-                                        targetAppName = resolvedAppName,
-                                        targetPackage = targetPackage,
-                                        authMethod = "BIOMETRIC"
-                                    )
-                                }
+                                handleFailedAttemptWithIntruderSelfie("BIOMETRIC")
                             },
                             onHardwareUnavailableOrNotEnrolled = {}
                         )
@@ -152,11 +176,11 @@ class LockOverlayActivity : FragmentActivity() {
                     onCooldownExpired = {
                         repository.prefsManager.clearExpiredCooldownIfNeeded()
                     },
-                    onExitToHomeScreen = if (isPhoneLockScreen && !isPreviewMode) {
+                    onExitToHomeScreen = if (currentIsPhoneLockScreen && !currentIsPreviewMode) {
                         null
                     } else {
                         {
-                            if (isPreviewMode) {
+                            if (currentIsPreviewMode) {
                                 finish()
                             } else {
                                 navigateToLauncherHome()
@@ -166,6 +190,20 @@ class LockOverlayActivity : FragmentActivity() {
                 )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        applyIntentExtras(intent)
+    }
+
+    private fun applyIntentExtras(intent: Intent?) {
+        currentTargetPackage = intent?.getStringExtra(EXTRA_TARGET_PACKAGE) ?: packageName
+        currentTargetAppName = intent?.getStringExtra(EXTRA_TARGET_APP_NAME) ?: ""
+        currentIsPreviewMode = intent?.getBooleanExtra(EXTRA_IS_PREVIEW_MODE, false) ?: false
+        currentIsPhoneLockScreen = intent?.getBooleanExtra(EXTRA_IS_PHONE_LOCK_SCREEN, false) ?: false
+        currentStartInAmbientAod = intent?.getBooleanExtra(EXTRA_START_IN_AMBIENT_AOD, false) ?: false
     }
 
     private fun configureLockScreenWindowFlags() {
@@ -183,7 +221,6 @@ class LockOverlayActivity : FragmentActivity() {
                         WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
                 )
             }
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
 
@@ -201,5 +238,6 @@ class LockOverlayActivity : FragmentActivity() {
         const val EXTRA_TARGET_APP_NAME = "extra_target_app_name"
         const val EXTRA_IS_PREVIEW_MODE = "extra_is_preview_mode"
         const val EXTRA_IS_PHONE_LOCK_SCREEN = "extra_is_phone_lock_screen"
+        const val EXTRA_START_IN_AMBIENT_AOD = "extra_start_in_ambient_aod"
     }
 }

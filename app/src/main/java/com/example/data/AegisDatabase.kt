@@ -28,12 +28,13 @@ data class LockedAppEntity(
 data class SecurityLogEntity(
     @PrimaryKey(autoGenerate = true) val id: Int = 0,
     val timestamp: Long = System.currentTimeMillis(),
-    val eventType: String, // FAILED_ATTEMPT, COOLDOWN_TRIGGERED, APP_UNLOCKED, BOOT_RESTORED, ADMIN_SHIELD, APP_INTERCEPTED
+    val eventType: String, // FAILED_ATTEMPT, COOLDOWN_TRIGGERED, APP_UNLOCKED, BOOT_RESTORED, ADMIN_SHIELD, APP_INTERCEPTED, NOTIFICATION_MASKED
     val targetAppName: String,
     val targetPackage: String,
     val authMethod: String, // FINGERPRINT, FACE_LOCK, PIN, PATTERN, SYSTEM
     val attemptNumber: Int = 0,
-    val details: String
+    val details: String,
+    val photoPath: String? = null
 )
 
 @Dao
@@ -66,7 +67,10 @@ interface AegisDao {
     fun observeSecurityLogs(): Flow<List<SecurityLogEntity>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertSecurityLog(log: SecurityLogEntity)
+    suspend fun insertSecurityLog(log: SecurityLogEntity): Long
+
+    @Query("UPDATE security_logs SET photoPath = :photoPath, details = :details WHERE id = :id")
+    suspend fun attachIntruderPhotoToLog(id: Int, photoPath: String, details: String)
 
     @Query("DELETE FROM security_logs")
     suspend fun clearSecurityLogs()
@@ -74,7 +78,7 @@ interface AegisDao {
 
 @Database(
     entities = [LockedAppEntity::class, SecurityLogEntity::class],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AegisDatabase : RoomDatabase() {

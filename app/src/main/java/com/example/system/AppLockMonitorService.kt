@@ -14,6 +14,7 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
@@ -31,10 +32,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Persistent Foreground Guardian Service.
- * 1. Monitors screen-off and screen-on events (ACTION_SCREEN_OFF / ACTION_SCREEN_ON) to
- *    display the custom Phone Lock Screen (showWhenLocked = true) when Phone Screen Lock is enabled.
- * 2. Monitors foreground app launches via UsageStatsManager to lock individual protected apps.
+ * Ultra-Low-Battery Guardian Service:
+ * 1. Event-Driven Mode (0% CPU / 0% Polling): When `AegisAccessibilityService` is enabled OR
+ *    when the phone screen is OFF (`ACTION_SCREEN_OFF`), the background loop is completely paused!
+ *    Zero background CPU wakes occur while the phone is idle or in your pocket.
+ * 2. Fallback Mode: Only if `AegisAccessibilityService` is NOT enabled AND the screen is currently
+ *    ON (`isInteractive == true`), runs a lightweight 1000ms UsageEvents check over a 2.5s window.
  */
 class AppLockMonitorService : Service() {
 
@@ -45,19 +48,29 @@ class AppLockMonitorService : Service() {
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val action = intent?.action ?: return
-            prefsManager.refreshState()
             val state = prefsManager.state.value
 
-            if (action == Intent.ACTION_SCREEN_OFF) {
-                if (state.relockOnScreenOff) {
-                    clearSessionUnlockedApps()
+            when (action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    // Immediately stop any background loop when screen turns off -> 0% battery in pocket!
+                    monitorJob?.cancel()
+                    monitorJob = null
+
+                    if (state.relockOnScreenOff) {
+                        clearSessionUnlockedApps()
+                    }
+                    if (state.isSetupCompleted && state.masterShieldEnabled && state.phoneScreenLockEnabled) {
+                        setHomeScreenGatePending(true)
+                        launchPhoneScreenLock(startInAmbientAod = true)
+                    }
                 }
-                if (state.isSetupCompleted && state.masterShieldEnabled && state.phoneScreenLockEnabled) {
-                    launchPhoneScreenLock()
-                }
-            } else if (action == Intent.ACTION_SCREEN_ON) {
-                if (state.isSetupCompleted && state.masterShieldEnabled && state.phoneScreenLockEnabled) {
-                    launchPhoneScreenLock()
+
+                Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                    if (state.isSetupCompleted && state.masterShieldEnabled && state.phoneScreenLockEnabled && isHomeScreenGatePending()) {
+                        launchPhoneScreenLock(startInAmbientAod = false)
+                    }
+                    // Only start fallback polling if AccessibilityService is NOT active
+                    updateMonitoringMode()
                 }
             }
         }
@@ -92,11 +105,58 @@ class AppLockMonitorService : Service() {
         }
 
         _isServiceRunning.value = true
-        startForegroundMonitoringLoop()
+        updateMonitoringMode()
         return START_STICKY
     }
 
-    private fun launchPhoneScreenLock() {
+    private fun isScreenInteractive(): Boolean {
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return true
+        return pm.isInteractive
+    }
+
+    /**
+     * Ensures 0% polling whenever:
+     * - The phone screen is OFF, OR
+     * - `AegisAccessibilityService` is enabled (since Accessibility is 100% event-driven!).
+     */
+    private fun updateMonitoringMode() {
+        if (!isScreenInteractive() || SystemPermissionHelper.isAccessibilityServiceEnabled(this)) {
+            monitorJob?.cancel()
+            monitorJob = null
+            return
+        }
+        if (monitorJob?.isActive == true) return
+
+        monitorJob = serviceScope.launch {
+            while (isActive) {
+                if (!isScreenInteractive() || SystemPermissionHelper.isAccessibilityServiceEnabled(this@AppLockMonitorService)) {
+                    // Switch to 0% CPU event-driven mode immediately
+                    break
+                }
+
+                val state = prefsManager.state.value
+                if (state.isSetupCompleted &&
+                    state.masterShieldEnabled &&
+                    SystemPermissionHelper.hasUsageStatsPermission(this@AppLockMonitorService)
+                ) {
+                    val topPkg = queryRecentForegroundPackage()
+                    if (!topPkg.isNullOrBlank() && topPkg != packageName && topPkg != "com.android.systemui") {
+                        if (state.phoneScreenLockEnabled && isHomeScreenGatePending()) {
+                            launchPhoneScreenLock(startInAmbientAod = false)
+                        } else {
+                            val lockedSet = prefsManager.getLockedPackageSet()
+                            if (lockedSet.contains(topPkg) && !isPackageUnlockedInSession(topPkg)) {
+                                launchLockInterceptor(topPkg)
+                            }
+                        }
+                    }
+                }
+                delay(1000L)
+            }
+        }
+    }
+
+    private fun launchPhoneScreenLock(startInAmbientAod: Boolean = false) {
         val lockIntent = Intent(this, LockOverlayActivity::class.java).apply {
             addFlags(
                 Intent.FLAG_ACTIVITY_NEW_TASK or
@@ -104,40 +164,19 @@ class AppLockMonitorService : Service() {
                     Intent.FLAG_ACTIVITY_SINGLE_TOP
             )
             putExtra(LockOverlayActivity.EXTRA_TARGET_PACKAGE, packageName)
-            putExtra(LockOverlayActivity.EXTRA_TARGET_APP_NAME, "Phone Lock Screen")
+            putExtra(LockOverlayActivity.EXTRA_TARGET_APP_NAME, "Phone Unlock Gate (Home Screen)")
             putExtra(LockOverlayActivity.EXTRA_IS_PHONE_LOCK_SCREEN, true)
+            putExtra(LockOverlayActivity.EXTRA_START_IN_AMBIENT_AOD, startInAmbientAod)
         }
         runCatching {
             startActivity(lockIntent)
         }
     }
 
-    private fun startForegroundMonitoringLoop() {
-        monitorJob?.cancel()
-        monitorJob = serviceScope.launch {
-            while (isActive) {
-                val state = prefsManager.state.value
-                if (state.isSetupCompleted &&
-                    state.masterShieldEnabled &&
-                    SystemPermissionHelper.hasUsageStatsPermission(this@AppLockMonitorService)
-                ) {
-                    val topPkg = queryTopForegroundPackage()
-                    if (!topPkg.isNullOrBlank() && topPkg != packageName) {
-                        val lockedSet = prefsManager.getLockedPackageSet()
-                        if (lockedSet.contains(topPkg) && !sessionUnlockedPackages.contains(topPkg)) {
-                            launchLockInterceptor(topPkg)
-                        }
-                    }
-                }
-                delay(450L)
-            }
-        }
-    }
-
-    private fun queryTopForegroundPackage(): String? {
+    private fun queryRecentForegroundPackage(): String? {
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager ?: return null
         val endTime = System.currentTimeMillis()
-        val beginTime = endTime - 10_000L
+        val beginTime = endTime - 2500L
         val usageEvents = usm.queryEvents(beginTime, endTime) ?: return null
         val event = UsageEvents.Event()
         var latestPkg: String? = null
@@ -157,7 +196,7 @@ class AppLockMonitorService : Service() {
 
     private fun launchLockInterceptor(targetPackage: String) {
         val now = System.currentTimeMillis()
-        if (targetPackage == lastInterceptedPackage && (now - lastInterceptTimeMs) < 1500L) {
+        if (targetPackage == lastInterceptedPackage && (now - lastInterceptTimeMs) < 1200L) {
             return
         }
         lastInterceptedPackage = targetPackage
@@ -201,7 +240,8 @@ class AppLockMonitorService : Service() {
             .setContentText(getString(R.string.notif_active_body, lockedCount))
             .setContentIntent(pendingIntent)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
             .build()
     }
 
@@ -223,8 +263,22 @@ class AppLockMonitorService : Service() {
         val isServiceRunning: StateFlow<Boolean> = _isServiceRunning.asStateFlow()
 
         private val sessionUnlockedPackages = mutableSetOf<String>()
+        @Volatile
+        private var homeScreenGatePending: Boolean = false
         private var lastInterceptedPackage: String? = null
         private var lastInterceptTimeMs: Long = 0L
+
+        fun setHomeScreenGatePending(pending: Boolean) {
+            homeScreenGatePending = pending
+        }
+
+        fun isHomeScreenGatePending(): Boolean = homeScreenGatePending
+
+        fun isPackageUnlockedInSession(pkg: String): Boolean {
+            synchronized(sessionUnlockedPackages) {
+                return sessionUnlockedPackages.contains(pkg)
+            }
+        }
 
         fun markPackageUnlockedForSession(pkg: String) {
             synchronized(sessionUnlockedPackages) {

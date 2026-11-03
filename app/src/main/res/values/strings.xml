@@ -16,4 +16,7 @@
     <string name="biometric_prompt_negative">Use Password</string>
     <string name="cooldown_banner_title">Try Again Later</string>
     <string name="cooldown_banner_subtitle">Too many wrong attempts. Try again in %1$ds.</string>
+    <string name="accessibility_service_label">Aegis Real-Time App &amp; Screen Lock</string>
+    <string name="accessibility_service_description">Detects when locked apps or the Home Screen are opened to immediately display your lock screen.</string>
+    <string name="notification_listener_label">Aegis Locked App Notification Shield</string>
 </resources>

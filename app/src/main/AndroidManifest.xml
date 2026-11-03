@@ -5,7 +5,7 @@
     <!-- Biometric hardware authentication (Fingerprint + Face Unlock) -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
 
-    <!-- Front Camera for Face Lock enrollment & verification -->
+    <!-- Front Camera for Intruder Selfie capture on wrong password attempts -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature
         android:name="android.hardware.camera"
@@ -24,6 +24,9 @@
     <uses-permission
         android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
+
+    <!-- Battery Optimization Exemption so OEMs (Xiaomi/Vivo/Samsung) never kill the lock service -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- Foreground guardian service -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -116,6 +119,35 @@
                 <action android:name="android.app.action.DEVICE_ADMIN_DISABLED" />
             </intent-filter>
         </receiver>
+
+        <!-- Real-Time Accessibility Service: 0ms App & Home Screen Lock Interception -->
+        <service
+            android:name=".system.AegisAccessibilityService"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="true"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- Locked App Notification Shield: Replaces locked app notifications with "New notification" -->
+        <service
+            android:name=".system.AegisNotificationListenerService"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="true"
+            android:label="@string/notification_listener_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
 
     </application>
 
