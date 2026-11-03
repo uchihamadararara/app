@@ -2,8 +2,7 @@ name: Android APK Build
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -11,33 +10,44 @@ permissions:
 
 jobs:
   build:
-    name: Build Debug APK
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup JDK 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Accept Android SDK Licenses
+      - name: Find Android SDK Manager
+        shell: bash
         run: |
-          yes | sdkmanager --licenses
+          set -e
+          SDKMANAGER=$(find /usr/local/lib/android/sdk /opt/android-sdk /usr/lib/android-sdk -type f -name sdkmanager 2>/dev/null | head -n 1)
 
-      - name: Install Android SDK Components
-        run: |
-          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found"
+            exit 1
+          fi
 
-      - name: Install Gradle
+          SDK_ROOT="${SDKMANAGER%%/cmdline-tools/*}"
+          echo "Found: $SDKMANAGER"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+
+          yes | "$SDKMANAGER" --licenses || true
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
 
-      - name: Build Debug APK
+      - name: Build APK
         run: gradle --no-daemon assembleDebug
 
       - name: Upload APK
