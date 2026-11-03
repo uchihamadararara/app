@@ -38,10 +38,9 @@ jobs:
 
       - name: Generate Debug Keystore
         run: |
-          mkdir -p app
           keytool -genkeypair \
             -v \
-            -keystore app/debug.keystore \
+            -keystore debug.keystore \
             -storepass android \
             -alias androiddebugkey \
             -keypass android \
@@ -49,6 +48,9 @@ jobs:
             -keysize 2048 \
             -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
+
+          test -f debug.keystore
+          ls -lh debug.keystore
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
